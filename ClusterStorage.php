@@ -17,6 +17,11 @@ namespace DS;
  */
 class ClusterStorage {
 	/**
+	 * ClusterStorage Version
+	 */
+	const VERSION = "1.0";
+	
+	/**
 	 * @var resource The current stream context
 	 */
 	public $context;
@@ -27,14 +32,44 @@ class ClusterStorage {
 	static protected $servers = array();
 	
 	/**
+	 * @var \Memcache Memcache connection
+	 */
+	static protected $memcache;
+	
+	/**
+	 * @var string Prefix for memcache keys
+	 */
+	static protected $memcache_namespace;
+	
+	/**
+	 * @var PDO DB Connection
+	 */
+	static protected $db;
+	
+	/**
 	 * @var string The protocol for the stream, defaults to cluster://
 	 */
 	static protected $protocol;
 	
 	/**
-	 * @var string The current nodes hostname
+	 * @var string Absolute Base path, all requested files will be sub-directories of this path
+	 */
+	static protected $basepath;
+	
+	/**
+	 * @var string Current node identity
 	 */
 	static protected $identity;
+	
+	/**
+	 * @var string Protocol to use for internal cluster communication
+	 */
+	static protected $protocol;
+	
+	/**
+	 * @var resource Local file pointer
+	 */
+	protected $fp;
 	
 	/**
 	 * Add a server to the storage pool
@@ -45,15 +80,66 @@ class ClusterStorage {
 	 * @param string $basepath Server local storage basepath
 	 * @param array $options All other options (timeout, weight)
 	 */
-	static public function addServer($host, $port, $endpoint, $basepath, array $options = array())
+	static public function addStorageServer($host, $port, $endpoint, array $options = array())
 	{
-		self::$servers[] = array('host' => $host, 'post' => $port, 'endpoint' => $endpoint, 'basepath' => $basepath, 'options' => $options);
+		self::$servers[] = array('host' => $host, 'post' => $port, 'endpoint' => $endpoint, 'options' => $options);
 		$context = array(
 			self::$protocol => array(
 				'pool' => self::$servers,
 			)
 		);
 		\stream_context_set_default($context);
+	}
+	
+	/**
+	 * Set the memcache connector
+	 * 
+	 * @param Memcache $memcache
+	 * @param string $namespace Memcache key prefix, will be appended with an underscore
+	 */
+	static public function setMemcache(Memcache $memcache, $namespace = '')
+	{
+		self::$memcache = $memcache;
+		if ($namespace != '') {
+			self::$memcache_namespace = $namespace . '_';
+		}
+	}
+	
+	/**
+	 * Set the DB connector
+	 * 
+	 * @param PDO $pdo PDO or PDO Compatible DB adapter. Currently supports MySQL.
+	 */
+	static public function setDBAdapter($db)
+	{
+		self::$db = $db;
+	}
+	
+	/**
+	 * Set the basepath for the storage
+	 * 
+	 * @param string $path Absolute Base path, all requested files will be sub-directories of this path
+	 */
+	static public function setBasePath($path)
+	{
+		self::$basepath = $path;
+	}
+	
+	static public function useSSL($flag = true)
+	{
+		if ($flag) {
+			self::$protocol = 'https';
+		} else {
+			self::$protocol = 'http';
+		}
+	}
+	
+	/**
+	 * @param string $identity Identify of the current node
+	 */
+	static public function identify($identity)
+	{
+		self::$identity = $identity;
 	}
 	
 	/**
@@ -67,19 +153,40 @@ class ClusterStorage {
 		\stream_register_wrapper($protocol, __NAMESPACE__ . '\ClusterStorage');
 	}
 	
-	/**
-	 * Identify the current node
-	 * 
-	 * @param string $host 
-	 */
-	static public function identify($host)
+	protected function persist($path, $data)
 	{
-		self::$identity = $host;
+		$values = array(
+			':key' => $path,
+			':data' => \json_encode($data)
+		);
+		$query = self::$db->prepare("REPLACE INTO cluster_store (key, data) VALUES (:key, :data)");
+		$query->execute($values);
+	}
+	
+	protected function register($path)
+	{
+		// Fetch the memcache data again, in case this took a while
+		if (!$data = self::$memcache->get(self::$memcache_namespace . $path)) {
+			$data = array('nodes' => array(self::$identity));
+		} else {
+			$data = \json_decode($data, true);
+			if (!in_array(self::$identity, $data['nodes'])) {
+				$data['nodes'][] = self::$identity;
+			}
+		}
+		
+		self::$memcache->set(self::$memcache_namespace . $path, \json_encode($data));
 	}
 	
 	public function __construct()
 	{
+		if (!(self::$memcache instanceof \Memcache)) {
+			throw new DS\ClusterStorage\Exception("Memcache storage not set.");
+		}
 		
+		if (!self::$basepath) {
+			throw new DS\ClusterStorage\Exception("Basepath not set.");
+		}
 	}
 	
 	public function __destruct()
@@ -164,24 +271,95 @@ class ClusterStorage {
 	 * 7. Add the local node to the registry
 	 * 8. Open the local file
 	 * 
-	 * @param type $path
-	 * @param type $mode
+	 * @param type $path Path within the cluster
+	 * @param type $mode Mode — ignored, always set to r+, or rb+ on windows
 	 * @param type $options
 	 * @param type $opened_path 
 	 */
 	public function stream_open($path, $mode, $options, &$opened_path)
 	{
-
+		$file = self::$basepath .\DIRECTORY_SEPARATOR. $path;
+		
+		if (!$data = self::$memcache->get(self::$memcache_namespace . $path)) {
+			$query = self::$db->prepare("SELECT data FROM cluster_store WHERE key = :path");
+			/* @var $query PDOStatement */
+			$result = $query->execute(array(':path' => $path));
+			if (!$result || $query->rowCount() == 0) {
+				$data = '';
+			}
+			$data = $query->fetchColumn();
+		}
+			
+		if (!$data) {
+			// This is a new file
+			$this->fp = fopen($file, $mode, false, $this->context);
+			return true;
+		}
+		
+		$data = \json_decode($data, true);
+		if ($data['deleted']) {
+			// The file has been deleted, lets delete the local file if it exists
+			if (\file_exists($file)) {
+				// We silence this, just in case
+				@\unlink($file);
+				// And we save to the DB to be sure
+				$this->persist($path, $data);
+			}
+			return false;
+		}
+		
+		if (in_array(self::$identity, $data['nodes']) && file_exists($file)) {
+			// The file exists on the current node, open it
+			$fp = \fopen($file, $mode, false, $this->context);
+		} else {
+			// Create all necessary parent directories
+			$dir = $path;
+			while ($dir != self::$basepath && !\file_exists(dirname($dir))) {
+				$missing[] = $dir;
+			}
+			$missing = \array_reverse($missing);
+			$current = self::$basepath;
+			foreach($missing as $part) {
+				$current .= \DIRECTORY_SEPARATOR . $part;
+				\mkdir($current);
+			}
+			
+			// Fetch the file from an existing node
+			$remote = \array_rand($data['nodes']);
+			$remote_fp = \fopen(self::$protocol . '://' . $remote . '/store?path=' . \urlencode($path));
+			
+			// Open the local pointer
+			$fp = \fopen($file, $mode, false, $this->context);
+			while ($remote_data = \fread($remote_fp, 1024)) {
+				\fwrite($fp, $remote_data, 1024);
+			}
+			\fclose($remote_fp);
+			unset($remote_data);
+			
+			// Move back to the beginning
+			\fseek($fp, 0);
+			
+			$this->register($path);
+		}
+		
+		$this->fp = $fp;
+		
+		// Do this last, so that if we pull and update for the current node, that gets synced
+		if ($_SERVER['REQUEST_TIME'] % 60 == 0) {
+			$this->persist($path, $data);
+		}
+		
+		return true;
 	}
 
 	public function stream_read($count)
 	{
-
+		return fread($fp, $count);
 	}
 
 	public function stream_seek($offset, $whence = SEEK_SET)
 	{
-
+		
 	}
 
 	public function stream_set_option($option, $arg1, $arg2)
@@ -219,8 +397,3 @@ class ClusterStorage {
 
 	}
 }
-
-/*
-ClusterStorage::registerStream();
-ClusterStorage::addServer('localhost', '11311', '/clusterfs.php', 'test');
-*/
