@@ -39,7 +39,7 @@ class ClusterStorage {
 	/**
 	 * @var string Prefix for memcache keys
 	 */
-	static protected $memcache_namespace;
+	static protected $memcache_prefix;
 	
 	/**
 	 * @var PDO DB Connection
@@ -95,13 +95,13 @@ class ClusterStorage {
 	 * Set the memcache connector
 	 * 
 	 * @param Memcache $memcache
-	 * @param string $namespace Memcache key prefix, will be appended with an underscore
+	 * @param string $prefix Memcache key prefix, will be appended with an underscore
 	 */
-	static public function setMemcache(Memcache $memcache, $namespace = '')
+	static public function setMemcache(Memcache $memcache, $prefix = '')
 	{
 		self::$memcache = $memcache;
-		if ($namespace != '') {
-			self::$memcache_namespace = $namespace . '_';
+		if ($prefix != '') {
+			self::$memcache_prefix = $prefix . '_';
 		}
 	}
 	
@@ -166,7 +166,7 @@ class ClusterStorage {
 	protected function register($path)
 	{
 		// Fetch the memcache data again, in case this took a while
-		if (!$data = self::$memcache->get(self::$memcache_namespace . $path)) {
+		if (!$data = self::$memcache->get(self::$memcache_prefix . $path)) {
 			$data = array('nodes' => array(self::$identity));
 		} else {
 			$data = \json_decode($data, true);
@@ -175,7 +175,7 @@ class ClusterStorage {
 			}
 		}
 		
-		self::$memcache->set(self::$memcache_namespace . $path, \json_encode($data));
+		self::$memcache->set(self::$memcache_prefix . $path, \json_encode($data));
 	}
 	
 	public function __construct()
@@ -280,7 +280,7 @@ class ClusterStorage {
 	{
 		$file = self::$basepath .\DIRECTORY_SEPARATOR. $path;
 		
-		if (!$data = self::$memcache->get(self::$memcache_namespace . $path)) {
+		if (!$data = self::$memcache->get(self::$memcache_prefix . $path)) {
 			$query = self::$db->prepare("SELECT data FROM cluster_store WHERE key = :path");
 			/* @var $query PDOStatement */
 			$result = $query->execute(array(':path' => $path));
@@ -326,7 +326,7 @@ class ClusterStorage {
 			
 			// Fetch the file from an existing node
 			$remote = \array_rand($data['nodes']);
-			$remote_fp = \fopen(self::$protocol . '://' . $remote . '/store?path=' . \urlencode($path));
+			$remote_fp = \fopen(self::$protocol . '://' . $remote . '/store/v' .self::VERSION. '?path=' . \urlencode($path));
 			
 			// Open the local pointer
 			$fp = \fopen($file, $mode, false, $this->context);
