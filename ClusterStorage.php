@@ -72,6 +72,11 @@ class ClusterStorage {
 	protected $fp;
 	
 	/**
+	 * @var boolean Whether the file has been written to or not
+	 */
+	protected $has_writes = false;
+	
+	/**
 	 * Add a server to the storage pool
 	 * 
 	 * @param string $host Server hostname
@@ -166,7 +171,7 @@ class ClusterStorage {
 	protected function register($path)
 	{
 		// Fetch the memcache data again, in case this took a while
-		if (!$data = self::$memcache->get(self::$memcache_prefix . $path)) {
+		if (!$data = $this->getRegistry($path)) {
 			$data = array('nodes' => array(self::$identity));
 		} else {
 			$data = \json_decode($data, true);
@@ -176,6 +181,21 @@ class ClusterStorage {
 		}
 		
 		self::$memcache->set(self::$memcache_prefix . $path, \json_encode($data));
+	}
+	
+	protected function getRegistry($path)
+	{
+		if (!$data = self::$memcache->get(self::$memcache_prefix . $path)) {
+			$query = self::$db->prepare("SELECT data FROM cluster_store WHERE key = :path");
+			/* @var $query PDOStatement */
+			$result = $query->execute(array(':path' => $path));
+			if (!$result || $query->rowCount() == 0) {
+				$data = '';
+			}
+			$data = $query->fetchColumn();
+		}
+		
+		return $data;
 	}
 	
 	public function __construct()
@@ -229,32 +249,31 @@ class ClusterStorage {
 
 	}
 
-	public function stream_cast($cast_as)
-	{
-
-	}
-
 	/**
 	 * Close the resource and push file to additional node(s)
 	 */
 	public function stream_close()
 	{
-
+		$this->stream_flush();
+		return \fclose($this->fp);
 	}
 
 	public function stream_eof()
 	{
-
+		return \feof($this->fp);
 	}
 
 	public function stream_flush()
 	{
-
+		$return = \fflush($this->fp);
+		
+		
+		// Push to another node if necessary
 	}
 
 	public function stream_lock($operation)
 	{
-
+		return \flock($this->fp, $operation);
 	}
 
 	/**
@@ -280,15 +299,7 @@ class ClusterStorage {
 	{
 		$file = self::$basepath .\DIRECTORY_SEPARATOR. $path;
 		
-		if (!$data = self::$memcache->get(self::$memcache_prefix . $path)) {
-			$query = self::$db->prepare("SELECT data FROM cluster_store WHERE key = :path");
-			/* @var $query PDOStatement */
-			$result = $query->execute(array(':path' => $path));
-			if (!$result || $query->rowCount() == 0) {
-				$data = '';
-			}
-			$data = $query->fetchColumn();
-		}
+		$data = $this->getRegistry($path);
 			
 		if (!$data) {
 			// This is a new file
@@ -354,32 +365,46 @@ class ClusterStorage {
 
 	public function stream_read($count)
 	{
-		return fread($fp, $count);
+		return \fread($fp, $count);
 	}
 
 	public function stream_seek($offset, $whence = SEEK_SET)
 	{
-		
+		return \fseek($this->fp, $offset, $whence);
 	}
 
-	public function stream_set_option($option, $arg1, $arg2)
+	public function stream_set_option($option, $arg1, $arg2 = null)
 	{
-
+		switch ($option) {
+			case \STREAM_OPTION_BLOCKING:
+				return \stream_set_blocking($this->fb, $arg1);
+				break;
+			case \STREAM_OPTION_READ_TIMEOUT:
+				return \stream_set_timeout($this->fp, $arg1, $arg2);
+				break;
+			case \STREAM_OPTION_WRITE_BUFFER:
+				return \stream_set_write_buffer($this->fp, $arg1);
+				break;
+			case \STREAM_OPTION_READ_BUFFER:
+				return \stream_set_read_buffer($this->fp, $arg1);
+				break;
+		}
 	}
 
 	public function stream_stat()
 	{
-
+		return \fstat($this->fp);
 	}
 
 	public function stream_tell()
 	{
-
+		return ftell($this->fp);
 	}
 
-	public function stream_write($data)
+	public function stream_write($data, $length = null)
 	{
-
+		$this->has_writes = true;
+		return fwrite($this->fp, $data, $length);
 	}
 
 	/**
@@ -389,11 +414,36 @@ class ClusterStorage {
 	 */
 	public function unlink($path)
 	{
-
+		return unlink(self::$basepath . \DIRECTORY_SEPARATOR . $path);
 	}
 
-	public function url_stat($path, $flags)
+	public function url_stat($path, $flags = false)
 	{
-
+		$file = self::$basepath . \DIRECTORY_SEPARATOR . $path;
+		
+		if (!file_exists($file)) {
+			return false;
+		}
+		
+		if (!$flags) {
+			$stat = stat($path);
+		} elseif ($flags == \STREAM_URL_STAT_QUIET) {
+			$stat = @stat($path);
+		} elseif ($flags == \STREAM_URL_STAT_LINK) {
+			$stat == lstat($path);
+		} elseif ($flags == \STREAM_URL_STAT_LINK|\STREAM_URL_STAT_QUIET) {
+			$stat == @lstat($path);
+		}
+		
+		$stat = (array) $stat;
+		
+		$data = $this->getRegistry($path);
+		if ($data['nodes']) {
+			$stat['cluster_nodes'] = $data['nodes'];
+		} else {
+			$stat['cluster_nodes'] = array();
+		}
+		
+		return $stat;
 	}
 }
