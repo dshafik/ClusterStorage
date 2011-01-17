@@ -47,9 +47,9 @@ class ClusterStorage {
 	static protected $db;
 	
 	/**
-	 * @var string The protocol for the stream, defaults to cluster://
+	 * @var string The scheme for the stream, defaults to cluster://
 	 */
-	static protected $protocol;
+	static protected $scheme;
 	
 	/**
 	 * @var string Absolute Base path, all requested files will be sub-directories of this path
@@ -65,6 +65,11 @@ class ClusterStorage {
 	 * @var string Protocol to use for internal cluster communication
 	 */
 	static protected $protocol;
+	
+	/**
+	 * @var octal The default file and folder mode
+	 */
+	static protected $mode = 0775;
 	
 	/**
 	 * @var resource Local file pointer
@@ -150,12 +155,22 @@ class ClusterStorage {
 	/**
 	 * Registers the stream wrapper
 	 * 
-	 * @param string $protocol The protocol for the stream (without ://), defaults to cluster://
+	 * @param string $scheme The protocol for the stream (without ://), defaults to cluster://
 	 */
-	static public function registerStream($protocol = 'cluster')
+	static public function registerStream($scheme = 'cluster')
 	{
-		self::$protocol = $protocol;
-		\stream_register_wrapper($protocol, __NAMESPACE__ . '\ClusterStorage');
+		self::$scheme = $scheme;
+		\stream_register_wrapper($scheme, __NAMESPACE__ . '\ClusterStorage');
+	}
+	
+	/**
+	 * Set the default permissions mode
+	 * 
+	 * @param octal $mode An octal number for the permissions
+	 */
+	static public function setDefaultMode($mode)
+	{
+		self::$mode = $mode;
 	}
 	
 	protected function persist($path, $data)
@@ -267,7 +282,6 @@ class ClusterStorage {
 	{
 		$return = \fflush($this->fp);
 		
-		
 		// Push to another node if necessary
 	}
 
@@ -324,16 +338,7 @@ class ClusterStorage {
 			$fp = \fopen($file, $mode, false, $this->context);
 		} else {
 			// Create all necessary parent directories
-			$dir = $path;
-			while ($dir != self::$basepath && !\file_exists(dirname($dir))) {
-				$missing[] = $dir;
-			}
-			$missing = \array_reverse($missing);
-			$current = self::$basepath;
-			foreach($missing as $part) {
-				$current .= \DIRECTORY_SEPARATOR . $part;
-				\mkdir($current);
-			}
+			mkdir(dirname($file), self::$mode, true);
 			
 			// Fetch the file from an existing node
 			$remote = \array_rand($data['nodes']);
