@@ -40,3 +40,17 @@ on commodity hardware (compared to Apache's 8.5K req/s).
 
 This test is not entirely accurate as there is no further checking against the persistent
 store to ensure if the file should be there.
+
+## Requirements ##
+
+ * PHP 5.3.3 (may work on older 5.3.x) 
+   * ext/fileinfo
+   * ext/pdo_mysql
+   * ext/memcache
+   * ext/apc (frapi)
+   * ext/http (pecl, frapi)
+ * Memcache
+ * MySQL 5.1
+ * [FRAPI](http://getfrapi.com/)
+  * PEAR
+  * PEAR::HTTP_Request2
