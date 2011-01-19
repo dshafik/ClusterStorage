@@ -408,7 +408,7 @@ class ClusterStorage {
 				
 				foreach ($servers as $node) {
 					$http = new \HttpRequest(self::$protocol . '://' . $node . '/v' .self::VERSION. '/store/' .$this->path, $request_method);
-					$http->addPostFile(basename($), $file)
+					$http->setBody($data);
 					$pool->attach($http);
 				}
 				
