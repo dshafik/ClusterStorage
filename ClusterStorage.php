@@ -21,6 +21,12 @@ class ClusterStorage {
 	 */
 	const VERSION = "1.0";
 	
+	const FILE_NEW = 1;
+	const FILE_OPEN = 2;
+	const FILE_CLOSE = 3;
+	const FILE_UPDATED = 4;
+	const FILE_DELETE = 5;
+	
 	/**
 	 * @var resource The current stream context
 	 */
@@ -72,14 +78,24 @@ class ClusterStorage {
 	static protected $mode = 0775;
 	
 	/**
+	 * @var int The minimum number of nodes to push the files to initially
+	 */
+	static protected $redundancy = 2;
+	
+	/**
+	 * @var string File name
+	 */
+	protected $path;
+	
+	/**
 	 * @var resource Local file pointer
 	 */
 	protected $fp;
 	
 	/**
-	 * @var boolean Whether the file has been written to or not
+	 * @var boolean Current file status
 	 */
-	protected $has_writes = false;
+	protected $status = null;
 	
 	/**
 	 * Add a server to the storage pool
@@ -135,6 +151,34 @@ class ClusterStorage {
 		self::$basepath = $path;
 	}
 	
+	/**
+	 * Set the default permissions mode
+	 * 
+	 * @param octal $mode An octal number for the permissions
+	 */
+	static public function setDefaultMode($mode)
+	{
+		self::$mode = $mode;
+	}
+	
+	/**
+	 * Set the minimum number of nodes to write the file to
+	 * 
+	 * You will need to balance the latency of replicating across the
+	 * network with the redundancy you desire
+	 * 
+	 * @param int $minimum_nodes The minimum number of nodes
+	 */
+	static public function setRedundancy($minimum_nodes)
+	{
+		self::$redundancy = $minimum_nodes;
+	}
+	
+	/**
+	 * Use SSL for inter-node communications
+	 * 
+	 * @param bool $flag Whether to use SSL or not
+	 */
 	static public function useSSL($flag = true)
 	{
 		if ($flag) {
@@ -164,25 +208,57 @@ class ClusterStorage {
 	}
 	
 	/**
-	 * Set the default permissions mode
-	 * 
-	 * @param octal $mode An octal number for the permissions
-	 */
-	static public function setDefaultMode($mode)
+	 * Constructor
+	 */	
+	public function __construct()
 	{
-		self::$mode = $mode;
+		if (!(self::$memcache instanceof \Memcache)) {
+			throw new DS\ClusterStorage\Exception("Memcache storage not set.");
+		}
+		
+		if (!self::$basepath) {
+			throw new DS\ClusterStorage\Exception("Basepath not set.");
+		}
 	}
 	
-	protected function persist($path, $data)
+	/**
+	 * Destructor
+	 */
+	public function __destruct()
+	{
+		if ($this->fp) {
+			$this->stream_close();
+		}
+	}
+	
+	/**
+	 * Store registry data in the DB
+	 * 
+	 * @param string $path file path
+	 * @param array $data registry data
+ 	 */
+	protected function persist($path, $data = false)
 	{
 		$values = array(
 			':key' => $path,
-			':data' => \json_encode($data)
 		);
-		$query = self::$db->prepare("REPLACE INTO cluster_store (key, data) VALUES (:key, :data)");
+		
+		if ($data !== false) {
+			$values[':data'] = \json_encode($data);
+			$query = self::$db->prepare("REPLACE INTO cluster_store (key, data) VALUES (:key, :data)");
+		} else {
+			$query = self::$db->prepare("DELETE FROM cluster_store WHERE key = :key");
+		}
+		
 		$query->execute($values);
 	}
 	
+	/**
+	 * Register file in the (memcache) registry
+	 * for this node
+	 * 
+	 * @param string $path file path
+	 */
 	protected function register($path)
 	{
 		// Fetch the memcache data again, in case this took a while
@@ -198,6 +274,24 @@ class ClusterStorage {
 		self::$memcache->set(self::$memcache_prefix . $path, \json_encode($data));
 	}
 	
+	/**
+	 * Unregister file in the (memcache) registry
+	 * for this node
+	 * 
+	 * @param string $path file path
+	 */
+	protected function unregister($path)
+	{
+		// Remove from memcache
+		self::$memcache->delete(self::$memcache_prefix . $path);
+	}
+	
+	/**
+	 * Get registry data for a given file
+	 * 
+	 * @param string $path file path
+	 * @return array 
+	 */
 	protected function getRegistry($path)
 	{
 		if (!$data = self::$memcache->get(self::$memcache_prefix . $path)) {
@@ -211,22 +305,6 @@ class ClusterStorage {
 		}
 		
 		return $data;
-	}
-	
-	public function __construct()
-	{
-		if (!(self::$memcache instanceof \Memcache)) {
-			throw new DS\ClusterStorage\Exception("Memcache storage not set.");
-		}
-		
-		if (!self::$basepath) {
-			throw new DS\ClusterStorage\Exception("Basepath not set.");
-		}
-	}
-	
-	public function __destruct()
-	{
-		
 	}
 
 	public function dir_closedir()
@@ -269,8 +347,12 @@ class ClusterStorage {
 	 */
 	public function stream_close()
 	{
-		$this->stream_flush();
-		return \fclose($this->fp);
+		if ($this->status == self::FILE_UPDATED || $this->status == self::FILE_NEW) {
+			$this->stream_flush();
+		}
+		$return = \fclose($this->fp);
+		$this->fp = false;
+		return $return;
 	}
 
 	public function stream_eof()
@@ -278,11 +360,63 @@ class ClusterStorage {
 		return \feof($this->fp);
 	}
 
+	/**
+	 * Store the file to the cluster
+	 * 
+	 * This method is only called when the file
+	 * has to be updated/created.
+	 * 
+	 * * This method must perform the following tasks:
+	 * 
+	 * 1. Flush the file to disk
+	 * 2. Reset the registry, the up-to-date file exists only on this node
+	 * 3. Add the current node to the registry
+	 * 4. Store the registry to the DB
+	 * 5. Replicate to other nodes
+	 */
 	public function stream_flush()
 	{
 		$return = \fflush($this->fp);
 		
-		// Push to another node if necessary
+		// Remove from the registry
+		$this->unregister($this->path);
+		
+		// Add fresh
+		$this->register($this->path);
+		
+		if (self::$redundancy == -1) {
+			$min_nodes = sizeof(self::$servers);
+		} else {
+			$min_nodes = self::$redundancy;
+		}
+		
+		$i = 1; // It's only on the current node
+		if ($i < $min_nodes) {
+			try {
+				if ($this->status == self::FILE_NEW) {
+					$request_method = \HttpRequest::METH_POST;
+				} else {
+					$request_method = \HttpRequest::METH_PUT;
+				}
+				
+				$servers = array_rand(self::$servers, $min_nodes - $i);
+				
+				$pool = new \HttpRequestPool();
+				
+				$data = \file_get_contents(self::$basepath .\DIRECTORY_SEPARATOR. $this->path);
+				$data = \gzdeflate($data);
+				
+				foreach ($servers as $node) {
+					$http = new \HttpRequest(self::$protocol . '://' . $node . '/v' .self::VERSION. '/store/' .$this->path, $request_method);
+					$http->addPostFile(basename($), $file)
+					$pool->attach($http);
+				}
+				
+				$pool->send();
+			} catch (Exception $e) {
+				
+			}
+		}
 	}
 
 	public function stream_lock($operation)
@@ -317,32 +451,29 @@ class ClusterStorage {
 			
 		if (!$data) {
 			// This is a new file
+			
+			$this->cleanup($file);
+			
 			$this->fp = fopen($file, $mode, false, $this->context);
+			$this->status = self::FILE_NEW;
 			return true;
 		}
 		
 		$data = \json_decode($data, true);
-		if ($data['deleted']) {
-			// The file has been deleted, lets delete the local file if it exists
-			if (\file_exists($file)) {
-				// We silence this, just in case
-				@\unlink($file);
-				// And we save to the DB to be sure
-				$this->persist($path, $data);
-			}
-			return false;
-		}
 		
 		if (in_array(self::$identity, $data['nodes']) && file_exists($file)) {
 			// The file exists on the current node, open it
 			$fp = \fopen($file, $mode, false, $this->context);
 		} else {
+			// The file exists, but not on the current node
+			$this->cleanup($file);
+			
 			// Create all necessary parent directories
 			mkdir(dirname($file), self::$mode, true);
 			
 			// Fetch the file from an existing node
 			$remote = \array_rand($data['nodes']);
-			$remote_fp = \fopen(self::$protocol . '://' . $remote . '/store/v' .self::VERSION. '?path=' . \urlencode($path));
+			$remote_fp = \fopen(self::$protocol . '://' . $remote . '/v' .self::VERSION. '/store/' . $path);
 			
 			// Open the local pointer
 			$fp = \fopen($file, $mode, false, $this->context);
@@ -360,12 +491,28 @@ class ClusterStorage {
 		
 		$this->fp = $fp;
 		
+		$this->status = self::FILE_OPEN;
+		
 		// Do this last, so that if we pull and update for the current node, that gets synced
 		if ($_SERVER['REQUEST_TIME'] % 60 == 0) {
 			$this->persist($path, $data);
 		}
 		
 		return true;
+	}
+	
+	protected function cleanup($file)
+	{
+		// If the file has previous been deleted from the cluster, lets delete the local file if it exists
+		if (\file_exists($file)) {
+			// We silence this, just in case
+			$return = @\unlink($file);
+			if (!$return) {
+				// We can't unlink, it would be bad to re-open it
+				\trigger_error("Unable to open file cleanly.", \E_USER_WARNING);
+				return false;
+			}
+		}
 	}
 
 	public function stream_read($count)
@@ -408,7 +555,9 @@ class ClusterStorage {
 
 	public function stream_write($data, $length = null)
 	{
-		$this->has_writes = true;
+		if ($this->status != self::FILE_NEW) {
+			$this->status = self::FILE_UPDATED;
+		}
 		return fwrite($this->fp, $data, $length);
 	}
 
@@ -419,7 +568,13 @@ class ClusterStorage {
 	 */
 	public function unlink($path)
 	{
-		return unlink(self::$basepath . \DIRECTORY_SEPARATOR . $path);
+		$this->unregister($path);
+		$this->persist($path);
+		
+		// Try to delete the file
+		@\unlink(self::$basepath . \DIRECTORY_SEPARATOR . $path);
+		
+		return true;
 	}
 
 	public function url_stat($path, $flags = false)
